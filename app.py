@@ -1162,7 +1162,7 @@ class Interpreter:
 # ============================================
 # An event is a plain dict {"type": ..., "line": ..., ...fields}. The engine REPORTS what happened;
 # the UI decides how to draw it. Events never change program state, and the UI never needs to know
-# which example program is running.
+# which program is running.
 #
 #  type                    emitted when                                  the UI uses it to
 #  ----------------------  --------------------------------------------  ----------------------------------
@@ -1394,7 +1394,7 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 .fly{position:absolute;left:0;top:0;background:var(--mi);color:#00251b;font:700 18px "JetBrains Mono",monospace;display:flex;align-items:center;justify-content:center;z-index:3;pointer-events:none}
 .abs{flex-wrap:nowrap}.ab{flex:1 1 0;min-width:0;max-width:60px}.ab.del{background:rgba(255,179,71,.14);border:2px solid var(--am)}.dx{display:block;text-decoration:none;font:700 9px "JetBrains Mono",monospace;color:#2a1700;background:var(--am);margin:2px 2px 0;padding:1px 0;white-space:nowrap;overflow:hidden}</style></head><body>
 <header><div class="logo"><span class="lg"><i></i><i></i><i></i></span>Memscope</div>
-<select id="ex" aria-label="Example"></select>
+
 <button class="go" id="run">▶ Run</button><button id="pause">⏸ Pause</button><button id="step">⏭ Step</button><button id="reset">↺ Reset</button></header>
 <main>
 <section><h2>Program<span class="seg"><button id="t1" class="on">Code</button><button id="t2">Blocks</button></span></h2>
@@ -1407,9 +1407,9 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 <footer id="out"><span>Output</span><div id="ot"></div></footer>
 <script>
 const $=id=>document.getElementById(id),BASE=0x1000,COL=['#6cb8ff','#b58cff','#ff8fa3','#7be0a0','#ffd166'];
-const EX=[['Array deletion','#include <stdio.h>\n\nint main() {\n    int arr[5] = {10, 20, 30, 40, 50};\n    int n = 5;\n    int deleteIndex = 2;\n\n    for (int i = deleteIndex; i < n - 1; i++) {\n        arr[i] = arr[i + 1];\n    }\n\n    n--;\n\n    return 0;\n}'],['Function call','int add(int x, int y) {\n    return x + y;\n}\n\nint main() {\n    int r = add(3, 4);\n    return 0;\n}'],['Reactive chain','int a = 10;\nint b = 20;\nint c = a + b;\nint d = c * 2;'],['Variables','int a = 10;\nint b = 20;\nint c = a + b;'],['Pointer','int a = 10;\nint *p = &a;'],['Pointer modification','int a = 10;\nint *p = &a;\n*p = 20;'],['Array','int numbers[4] = {10, 20, 30, 40};'],
-['Memory demo (a = 130)','int main() {\n    int a = 130;\n    char *ptr = (char *)&a;\n\n    printf("%d", *ptr);\n\n    return 0;\n}'],
-['Walking a pointer (ptr++)','int main() {\n    int a = 16909060;\n    char *ptr = (char *)&a;\n\n    ptr++;\n    ptr++;\n    printf("%d", *ptr);\n\n    return 0;\n}']];
+/* The editor starts with this text. It is just initial editor content: the user can replace it with any program,
+   and Run/Step/Reset always use whatever is in the editor at that moment. */
+const STARTER='int main() {\n    int a = 10;\n    int b = 20;\n    int c = a + b;\n    return 0;\n}';
 const BL=[['Variables','#6cb8ff',[['set a to 130','int a = 130;'],['change a by 1','a = a + 1;'],['set b to a + 10','int b = a + 10;']]],['Pointers','#ffb347',[['create pointer to a','char *ptr = (char *)&a;'],['move pointer one step','ptr++;'],['set value at pointer to 0','*ptr = 0;']]],['Arrays','#7be0a0',[['array of 4 numbers','int nums[4] = {10, 20, 30, 40};']]],['Output','#ff8fa3',[['print a','printf("%d", a);'],['print value at pointer','printf("%d", *ptr);']]],['Control (not simulated yet)','#8493b3',[['repeat 3 times','// repeat 3 { ... }'],['if a > 100','// if a > 100 { ... }']]]];
 let mem,vars,out,shown,pc,cur,frame,pf,sel,rdd,chg,nw,note,hlv,nextA,timer,ty,repr='HEX';const AR={};
 const sz=t=>t.ptr||t.b==='int'?4:1,pt=t=>({b:t.b,ptr:false}),tn=t=>t.b+(t.ptr?' *':''),hx=n=>'0x'+n.toString(16),H=n=>n.toString(16).toUpperCase().padStart(2,'0');
@@ -1492,8 +1492,6 @@ function sync(){const t=$('ta');$('hi').innerHTML=hl(t.value)+'\n';$('gin').inne
 function ins(code){const t=$('ta'),L=t.value.split('\n'),m=/main\(\)/.test(t.value);let i=L.findIndex(s=>/^\s*return\b/.test(s));if(i<0)i=L.length;
  if(i>0&&!L[i-1].trim()&&i<L.length)i--;L.splice(i,0,(m?'    ':'')+code);t.value=L.join('\n');sync();reset();tab(1)}
 function tab(c){$('ed').style.display=c?'flex':'none';$('bl').style.display=c?'none':'block';$('t1').className=c?'on':'';$('t2').className=c?'':'on'}
-$('ex').innerHTML=EX.map((e,i)=>`<option value="${i}">Example ${i+1} — ${e[0]}</option>`).join('');$('ex').value=0;
-$('ex').onchange=e=>{$('ta').value=EX[e.target.value][1];sync();reset()};
 $('ta').oninput=()=>{sync();reset()};
 $('ta').onscroll=e=>{const t=e.target;$('lay').style.transform=`translate(${-t.scrollLeft}px,${-t.scrollTop}px)`;$('gin').style.transform=`translateY(${-t.scrollTop}px)`};
 $('step').onclick=()=>{stop();step()};$('reset').onclick=reset;
@@ -1507,7 +1505,7 @@ $('vars').onclick=e=>{if(e.target.type==='range')return;const v=e.target.closest
 $('bl').innerHTML=BL.map(([h,c,bs])=>`<h3>${h}</h3>`+bs.map(([l,s])=>`<button class="blk" style="--c:${c}" data-c="${esc(s).replace(/"/g,'&quot;')}">${l}</button>`).join('')).join('');
 $('bl').onclick=e=>{const c=e.target.dataset.c;if(c)ins(c.replace(/&lt;/g,'<').replace(/&amp;/g,'&'))};
 $('t1').onclick=()=>tab(1);$('t2').onclick=()=>tab(0);
-$('ta').value=EX[0][1];sync();reset();tick();
+$('ta').value=STARTER;sync();reset();tick();
 </script></body></html>
 '''
 
