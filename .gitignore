@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Vercel local project link (created by `vercel link`)
+.vercel/
