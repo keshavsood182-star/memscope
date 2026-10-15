@@ -1500,6 +1500,7 @@ header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;
 .logo{font-weight:800;font-size:18px;display:flex;align-items:center;gap:8px;margin-right:auto}
 .lg{display:flex}.lg i{width:9px;height:14px;border:1.5px solid var(--am);margin-left:-1.5px}.lg i:nth-child(2){background:var(--am)}
 button,select{font:inherit;background:#1a2438;color:var(--t);border:1px solid var(--l);padding:6px 12px;border-radius:6px;cursor:pointer}
+button:disabled{opacity:.4;cursor:not-allowed;border-color:var(--l)}
 button:hover,select:hover{border-color:var(--am)}button:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--vi)}
 .go{background:var(--mi);color:#00251b;border-color:transparent;font-weight:700}.on{background:var(--vi);color:#fff;border-color:transparent}
 main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(250px,.8fr) minmax(380px,1.6fr);min-height:0}
@@ -1561,6 +1562,7 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 <header><div class="logo"><span class="lg"><i></i><i></i><i></i></span>Memscope</div>
 
 <button class="go" id="run">▶ Run</button><button id="pause">⏸ Pause</button><button id="step">⏭ Step</button><button id="reset">↺ Reset</button></header>
+<button id="prev" aria-label="Previous execution step">&#8592; Previous</button><button id="next" aria-label="Next execution step">&#8594; Next</button><span id="stepCount" class="mono" style="color:var(--d);font-size:12px">Step 0 / 0</span>
 <main>
 <section><h2>Program<span class="seg"><button id="t1" class="on">Code</button><button id="t2">Blocks</button></span></h2>
 <div id="ed"><div id="gut"><div id="gin"></div></div><div id="cw"><div id="lay"><div id="bar" style="display:none"></div><div id="nx"></div><pre id="hi"></pre></div><textarea id="ta" spellcheck="false" aria-label="C code"></textarea></div></div>
@@ -1572,6 +1574,8 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 <footer id="out"><span>Output</span><div id="ot"></div></footer>
 <script>
 const $=id=>document.getElementById(id),BASE=0x1000,COL=['#6cb8ff','#b58cff','#ff8fa3','#7be0a0','#ffd166'];
+/* Keep navigation controls beside Run/Step even though the compact HTML is assembled inline. */
+['prev','next','stepCount'].forEach(id=>document.querySelector('header').appendChild(document.getElementById(id)));
 /* The editor starts with this text. It is just initial editor content: the user can replace it with any program,
    and Run/Step/Reset always use whatever is in the editor at that moment. */
 const STARTER='int main() {\n    int a = 10;\n    int b = 20;\n    int c = a + b;\n    return 0;\n}';
@@ -1585,32 +1589,56 @@ const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;'),isEx=s=>{s=s.trim();re
    S mirrors the server's ProgramState snapshot; nothing here executes C or keeps its own variable values. */
 const MEMSZ=512;
 let S=null,nSteps=0,busy=false,running=false,epoch=0,E=[],RD=new Set(),vw=null,vn=null,vfr=null,vvs=null,rt=null,propv=null;
-const emptyState=()=>({mem:new Uint8Array(MEMSZ),vars:[],frames:[],out:'',line:0,sp:BASE,done:false,ok:false,E:[]});
+/* Checkpoints are serialized snapshots returned by the interpreter API.  They are the
+   same state the renderer uses, rather than a second UI execution model. */
+let history=[],historyPos=0;
+const emptyState=()=>({mem:new Uint8Array(MEMSZ),vars:[],frames:[],call_stack:[],next_frame_id:0,node_visits:0,out:'',line:0,sp:BASE,done:false,ok:false,E:[]});
 /* Decode helpers: turn the authoritative bytes in `mem` into numbers for display (little-endian). */
 const readU=(a,n)=>{let v=0;for(let i=n-1;i>=0;i--)v=v*256+mem[a-BASE+i];return v};
 const rdv=(t,a)=>t.ptr?readU(a,4):t.b==='char'?(x=>x>127?x-256:x)(readU(a,1)):(u=>u>=2**31?u-2**32:u)(readU(a,4));
 const val=v=>v.arr?'{'+Array.from({length:v.cnt},(_,k)=>rdv(v.t,v.a+k*sz(v.t))).join(', ')+'}':v.t.ptr?hx(rdv(v.t,v.a)):rdv(v.t,v.a);
 const isMove=e=>e.type==='MEMORY_WRITE'&&/^\w+\[\d+\]$/.test(e.from||'')&&/^\w+\[\d+\]$/.test(e.target||'');
 async function api(steps){const r=await fetch('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:$('ta').value,steps})});return r.json()}
-function applyState(d){S={mem:Uint8Array.from(d.state.mem),vars:d.state.vars,frames:d.state.frames,out:d.state.out,line:d.state.line,sp:d.state.sp,done:d.done,ok:true,E:d.events};mem=S.mem;vars=S.vars;E=S.E}
+function applyState(d){S={mem:Uint8Array.from(d.state.mem),vars:d.state.vars,frames:d.state.frames,call_stack:d.state.call_stack||[],next_frame_id:d.state.next_frame_id||0,node_visits:d.state.node_visits||0,out:d.state.out,line:d.state.line,sp:d.state.sp,done:d.done,ok:true,E:d.events||[]};mem=S.mem;vars=S.vars;E=S.E}
+function checkpoint(d){return JSON.parse(JSON.stringify({state:d.state,done:d.done,events:d.events||[],explanation:d.explanation||'',changed:d.changed||[],step:d.executed||0}))}
+function restoreCheckpoint(cp){
+  /* Restoring replaces the authoritative renderer state wholesale. Animations are cleared
+     because reverse execution is a state restore, not an attempted inverse animation. */
+  fin(); applyState(cp); nSteps=cp.step; chg=new Set(cp.changed||[]); RD=new Set(); nw=null; propv=null;
+  cur=S.line?S.line-1:null; note=cp.explanation||('Restored step '+cp.step+'.'); render(1); updateHistoryControls();
+}
+function updateHistoryControls(){
+  $('prev').disabled=historyPos<=0;
+  $('next').disabled=!!(S&&S.done);
+  $('stepCount').textContent='Step '+historyPos+' / '+Math.max(0,history.length-1);
+}
 /* step(): ask for state after nSteps+1 steps, then animate the difference. Returns the step's events or null when finished. */
 async function step(){fin();if(busy||S.done||!S.ok){stop();return null}
- const ep=epoch;busy=true;let d;try{d=await api(nSteps+1)}catch(e){busy=false;stop();note='⚠ Could not reach the server: '+e.message;render(1);return null}busy=false;
+ const ep=epoch;busy=true;let d;try{d=await api(historyPos+1)}catch(e){busy=false;stop();note='⚠ Could not reach the server: '+e.message;render(1);return null}busy=false;
  if(ep!==epoch)return null;
  if(d.error){S.done=true;note='⚠ '+d.error;stop();render(1);return null}
  if(!d.events.length){S.done=true;stop();render(1);return null}
  const b={m:mem.slice(),n:S.vars.length,fr:S.frames.slice(),vs:S.vars.slice()};
  nSteps=d.executed;applyState(d);chg=new Set(d.changed);RD=new Set();nw=null;propv=null;cur=S.line?S.line-1:null;
+ history=history.slice(0,historyPos+1);history.push(checkpoint(d));historyPos++;
  E.forEach(e=>{if(e.type==='MEMORY_READ'){const o=S.vars.find(v=>e.addr>=v.a&&e.addr<v.a+sz(v.t)*v.cnt);o&&RD.add(o.n)}if(e.type==='VARIABLE_CREATE')nw=S.vars.find(v=>v.a===e.address&&v.n===e.name)});
  const dd=[...E].reverse().find(e=>e.type==='POINTER_DEREFERENCE');if(dd)sel=dd.addr;
- note=d.explanation;present(b);if(S.done)stop();return E}
+ note=d.explanation;present(b);updateHistoryControls();if(S.done)stop();return E}
+async function previousStep(){
+  if(busy||historyPos<=0)return;
+  stop(); historyPos--; restoreCheckpoint(history[historyPos]);
+}
+async function nextStep(){
+  if(busy||S.done)return;
+  await step();
+}
 function stop(){running=false;$('pause').classList.remove('on')}
 function fin(){if(rt){clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;render(1)}}
 function present(b){const ms=E.some(e=>e.type==='BINARY_OPERATION')?2000:E.some(isMove)?1100:0;
  if(ms){vw=b.m;vn=b.n;vfr=b.fr;vvs=b.vs;render();rt=setTimeout(()=>{rt=null;vw=vn=vfr=vvs=null;render(1)},ms)}else render()}
-async function reset(){stop();clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;propv=null;clearInterval(ty);epoch++;nSteps=0;S=emptyState();mem=S.mem;vars=S.vars;E=S.E;RD=new Set();shown=0;cur=null;pf=0;sel=nw=hlv=null;chg=new Set();for(const k in AR)delete AR[k];
+async function reset(){stop();clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;propv=null;clearInterval(ty);epoch++;nSteps=0;history=[];historyPos=0;S=emptyState();mem=S.mem;vars=S.vars;E=S.E;RD=new Set();shown=0;cur=null;pf=0;sel=nw=hlv=null;chg=new Set();for(const k in AR)delete AR[k];
  note='Press Step or Run. Each action the program takes changes memory in a way you can see.';render();
- try{const d=await api(0);if(d.error){S.done=true;note='⚠ '+d.error}else applyState(d)}catch(e){S.done=true;note='⚠ Could not reach the server: '+e.message}render()}
+ try{const d=await api(0);if(d.error){S.done=true;note='⚠ '+d.error}else{applyState(d);history=[checkpoint(d)];historyPos=0}}catch(e){S.done=true;note='⚠ Could not reach the server: '+e.message}render();updateHistoryControls()}
 function hl(s){return esc(s).replace(/(\/\/.*)|("(?:[^"\\]|\\.)*")|\b(int|char|return|for)\b|\b(\d+)\b|\b(printf|main)\b/g,(m,c,q,k,n,f)=>`<span class="${c?'c':q?'s':k?'k':n?'n':'f'}">${m}</span>`)}
 const view=f=>{const M=mem;if(vw)mem=vw;try{return f()}finally{mem=M}},VV=()=>vvs||vars;
 const lg=v=>{const x=VV().find(x=>x.n==='n'&&!x.arr);return x?Math.max(0,Math.min(v.cnt,rdv(x.t,x.a))):v.cnt};
@@ -1660,6 +1688,7 @@ function tab(c){$('ed').style.display=c?'flex':'none';$('bl').style.display=c?'n
 $('ta').oninput=()=>{sync();reset()};
 $('ta').onscroll=e=>{const t=e.target;$('lay').style.transform=`translate(${-t.scrollLeft}px,${-t.scrollTop}px)`;$('gin').style.transform=`translateY(${-t.scrollTop}px)`};
 $('step').onclick=()=>{stop();step()};$('reset').onclick=reset;
+$('prev').onclick=previousStep;$('next').onclick=nextStep;
 $('pause').onclick=()=>stop();
 $('run').onclick=async()=>{if(running)return;if(S.done)await reset();running=true;$('pause').classList.add('on');
  while(running){const e=await step();if(!e||S.done)break;await new Promise(r=>setTimeout(r,e.some(x=>x.type==='BINARY_OPERATION'||isMove(x))?2400:1100))}stop()};
@@ -1670,6 +1699,16 @@ $('vars').onclick=e=>{if(e.target.type==='range')return;const v=e.target.closest
 $('bl').innerHTML=BL.map(([h,c,bs])=>`<h3>${h}</h3>`+bs.map(([l,s])=>`<button class="blk" style="--c:${c}" data-c="${esc(s).replace(/"/g,'&quot;')}">${l}</button>`).join('')).join('');
 $('bl').onclick=e=>{const c=e.target.dataset.c;if(c)ins(c.replace(/&lt;/g,'<').replace(/&amp;/g,'&'))};
 $('t1').onclick=()=>tab(1);$('t2').onclick=()=>tab(0);
+/* Keyboard controls intentionally ignore editable targets so arrows, space, and R
+   retain their normal meaning while the source editor or a form field has focus. */
+document.addEventListener('keydown',e=>{
+ const el=e.target,editing=el&&(['INPUT','TEXTAREA','SELECT'].includes(el.tagName)||el.isContentEditable);
+ if(editing)return;
+ if(e.key==='ArrowRight'){e.preventDefault();nextStep()}
+ else if(e.key==='ArrowLeft'){e.preventDefault();previousStep()}
+ else if(e.key===' '){e.preventDefault();if(running)stop();else $('run').click()}
+ else if(e.key==='r'||e.key==='R'){e.preventDefault();reset()}
+});
 $('ta').value=STARTER;sync();reset();tick();
 </script></body></html>
 '''
@@ -1719,6 +1758,12 @@ def run_program(source: str, steps: int) -> dict:
             "mem": list(state.memory.data),
             "vars": [v.to_json() for v in state.variables],
             "frames": [{"id": f.id, "fn": f.fn} for f in state.frames],
+            # These fields keep checkpoints faithful to the interpreter state.  The browser
+            # does not execute with them, but restoring them makes navigation complete and
+            # leaves ProgramState as the only source of truth.
+            "call_stack": list(state.call_stack),
+            "next_frame_id": state.next_frame_id,
+            "node_visits": state.node_visits,
             "out": state.output,
             "line": state.line,
             "sp": state.memory.sp,
