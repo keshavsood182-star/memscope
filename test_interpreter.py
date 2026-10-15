@@ -8,8 +8,8 @@ import unittest
 from app import Interpreter, Parser, tokenize
 
 
-def run(source):
-    engine = Interpreter(Parser(tokenize(source)).parse_program())
+def run(source, inputs=None):
+    engine = Interpreter(Parser(tokenize(source)).parse_program(), inputs or [])
     events = []
     while True:
         step = engine.step()
@@ -49,6 +49,31 @@ class LanguageRegressionTests(unittest.TestCase):
         self.assertEqual(result, 7)
         self.assertIn("FUNCTION_CALL", [e["type"] for e in events])
         self.assertIn("POINTER_DEREFERENCE", [e["type"] for e in events])
+
+    def test_string_input_and_printf(self):
+        state, events, result = run('int main(){char str[100];scanf("%s",str);printf("%s",str);return 0;}', ["hello"])
+        self.assertEqual(state.output, "hello")
+        self.assertEqual(result, 0)
+        self.assertIn("INPUT_RECEIVED", [e["type"] for e in events])
+
+    def test_strlen_and_strcmp(self):
+        _, _, length = run('int main(){char a[100],b[100];scanf("%s",a);scanf("%s",b);return strlen(a);}', ["hello", "world"])
+        self.assertEqual(length, 5)
+        _, _, equal = run('int main(){char a[100],b[100];scanf("%s",a);scanf("%s",b);return strcmp(a,b);}', ["hello", "hello"])
+        self.assertEqual(equal, 0)
+
+    def test_char_index_and_literal(self):
+        _, _, result = run("int main(){char s[100];scanf(\"%s\",s);if(s[0]=='a')return 1;return 0;}", ["apple"])
+        self.assertEqual(result, 1)
+
+    def test_generic_palindrome_flow(self):
+        source = ('int main(){char str[100],rev[100];int i,len;scanf("%s",str);'
+                  'len=strlen(str);for(i=0;i<len;i++){rev[i]=str[len-i-1];}'
+                  'rev[len]=\'\\0\';if(strcmp(str,rev)==0){printf("Palindrome");return 1;}'
+                  'printf("Not a palindrome");return 0;}')
+        state, _, palindrome = run(source, ["madam"])
+        self.assertEqual(state.output, "Palindrome")
+        self.assertEqual(palindrome, 1)
 
 
 if __name__ == "__main__":

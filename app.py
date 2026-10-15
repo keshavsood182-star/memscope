@@ -174,6 +174,11 @@ class ProgramState:
         self.done = False                       # program finished or crashed
         self.next_frame_id = 0
         self.node_visits = 0                    # budget counter, see MAX_NODE_VISITS
+        # Values supplied by the browser for scanf during deterministic replay. The
+        # interpreter consumes them in source order; no terminal stdin is involved.
+        self.input_values: list[str] = []
+        self.input_cursor = 0
+        self.string_literals: dict[str, int] = {}
         # --- transient flags used while evaluating one expression ---
         self.quiet = 0                          # >0: evaluate silently (no events); used for reactive re-evaluation
         self.index_depth = 0                    # >0: we are inside `[...]` -> arithmetic is INDEX arithmetic
@@ -596,32 +601,38 @@ class Parser:
 
     # ---- statements ----
     def declaration(self, no_react: bool = False) -> SimpleNamespace:
-        """`int x = e;`, `int a[5] = {..};`, `char *p = ...;`. Consumes the trailing ';'.
-        `no_react=True` is used for `for (int i = ...)` so the loop counter is never made reactive."""
+        """Parse scalar/array declarations, including comma-separated declarators.
+        `no_react=True` is used for `for (int i = ...)` so the loop counter is never reactive."""
         line = self.t[self.i].line
         ctype = self.parse_type()
-        name = self.next()
-        if name.kind != "id":
-            raise MemscopeError(f"Expected a name on line {name.line}")
-        size = None
-        if self.accept("["):
-            size = 0 if self.is_("]") else int(self.next().text)   # 0 = "infer from initializer"
-            self.expect("]")
-        init = None
-        if self.accept("="):
-            if self.is_("{"):
-                self.i += 1
-                items = []
-                while not self.is_("}"):
-                    items.append(self.assignment())
-                    if not self.accept(","):
-                        break
-                self.expect("}")
-                init = node("InitList", line, items=items)
-            else:
-                init = self.expression()
+        decls = []
+        while True:
+            name = self.next()
+            if name.kind != "id":
+                raise MemscopeError(f"Expected a name on line {name.line}")
+            size = None
+            if self.accept("["):
+                size = 0 if self.is_("]") else int(self.next().text)
+                self.expect("]")
+            init = None
+            if self.accept("="):
+                if self.is_("{"):
+                    self.i += 1
+                    items = []
+                    while not self.is_("}"):
+                        items.append(self.assignment())
+                        if not self.accept(","):
+                            break
+                    self.expect("}")
+                    init = node("InitList", line, items=items)
+                else:
+                    init = self.expression()
+            decls.append(node("Decl", line, ctype=ctype, name=name.text, size=size,
+                              init=init, no_react=no_react))
+            if not self.accept(","):
+                break
         self.expect(";")
-        return node("Decl", line, ctype=ctype, name=name.text, size=size, init=init, no_react=no_react)
+        return decls[0] if len(decls) == 1 else node("DeclGroup", line, decls=decls)
 
     def expression_statement(self) -> SimpleNamespace:
         line = self.peek().line
@@ -809,8 +820,9 @@ class Interpreter:
         interp.state                # inspect memory / variables / output after the step
     """
 
-    def __init__(self, program: SimpleNamespace) -> None:
+    def __init__(self, program: SimpleNamespace, input_values: Optional[list[str]] = None) -> None:
         self.state = ProgramState()
+        self.state.input_values = list(input_values or [])
         self._steps = self._run_program(program)
 
     # ---- public API --------------------------------------------------------------------
@@ -941,13 +953,22 @@ class Interpreter:
                 pop_scope(s, frame)         # always, even on return: ends the block's variables
             return None
 
+        if k == "DeclGroup":
+            for decl in n.decls:
+                result = yield from self._exec(decl)
+                if result is not None:
+                    return result
+            return None
+
         if k == "Decl":
             # 1. Evaluate the initializer FIRST (reads happen before the new variable exists).
             #    dep_collector records which variables it reads -> reactive dependencies.
             s.dep_collector = set()
             values = None
             if n.init is not None:
-                if n.init.k == "InitList":
+                if n.init.k == "Str" and n.ctype.base == "char" and n.size is not None:
+                    values = [ord(ch) for ch in decode_c_escapes(n.init.v)] + [0]
+                elif n.init.k == "InitList":
                     values = []
                     for item in n.init.items:
                         values.append((yield from self._eval(item)).v)
@@ -1157,6 +1178,21 @@ class Interpreter:
         for item in self._propagate({var}):
             emit(self.state, "REACTIVE_UPDATE", name=item["name"], old=item["old"], value=item["new"])
 
+    def _string_value(self, pointer: Val) -> str:
+        """Read a null-terminated char pointer through ProgramState memory."""
+        if not pointer.ctype.ptr or pointer.ctype.base != "char":
+            raise MemscopeError("Expected a char pointer or character array")
+        chars = []
+        for offset in range(MEM_SIZE):
+            addr = pointer.v + offset
+            byte = self.state.memory.read_byte(addr)
+            emit(self.state, "MEMORY_READ", addr=addr, size=1, value=byte,
+                 source=f"{pointer.label}[{offset}]")
+            if byte == 0:
+                break
+            chars.append(chr(byte))
+        return "".join(chars)
+
     # ---- expressions -------------------------------------------------------------------
     def _lvalue(self, n, rw: str) -> Generator:
         """Compute WHERE `n` lives. rw is 'r' (about to be read) or 'w' (about to be written); it is
@@ -1216,6 +1252,21 @@ class Interpreter:
 
         if k == "Num":
             return Val(n.v, INT, str(n.v))
+
+        if k == "Str":
+            # String literals are immutable char bytes in simulated memory, so library
+            # calls can use the same pointer/array paths as user-created char arrays.
+            if n.v not in s.string_literals:
+                raw = decode_c_escapes(n.v).encode("latin1") + b"\0"
+                addr = s.memory.allocate(len(raw))
+                s.string_literals[n.v] = addr
+                emit(s, "MEMORY_ALLOCATE", addr=addr, size=len(raw), name="string literal")
+                for offset, byte in enumerate(raw):
+                    s.memory.write_byte(addr + offset, byte)
+                    emit(s, "MEMORY_WRITE", addr=addr + offset, size=1, value=byte,
+                         target="string literal", **{"from": "literal"})
+            addr = s.string_literals[n.v]
+            return Val(addr, CType("char", True), '"' + n.v + '"')
 
         if k == "Var":
             var = lookup_variable(s, n.name)
@@ -1309,11 +1360,97 @@ class Interpreter:
                 values = []
                 for arg in n.args[1:]:
                     values.append((yield from self._eval(arg)))
-                text = format_printf(n.args[0].v, values)
+                text = format_printf(n.args[0].v, values, s)
                 s.output += text
                 emit(s, "OUTPUT", text=text)
                 yield
                 return Val(len(text), INT)
+            if n.name == "strlen":
+                if len(n.args) != 1:
+                    raise MemscopeError("strlen expects one char pointer or array")
+                pointer = yield from self._eval(n.args[0])
+                return Val(len(self._string_value(pointer)), INT, "strlen")
+            if n.name == "strcmp":
+                if len(n.args) != 2:
+                    raise MemscopeError("strcmp expects two char pointers or arrays")
+                left = yield from self._eval(n.args[0])
+                right = yield from self._eval(n.args[1])
+                lv, rv = self._string_value(left), self._string_value(right)
+                return Val(0 if lv == rv else (-1 if lv < rv else 1), INT, "strcmp")
+            if n.name == "scanf":
+                if len(n.args) != 2 or n.args[0].k != "Str" or n.args[0].v not in ("%d", "%s"):
+                    raise MemscopeError("scanf supports scanf(\"%d\", &integer) and scanf(\"%s\", char_array)")
+                # Resolve the destination through the normal expression evaluator so
+                # &n, array elements, and pointer-compatible addresses use ProgramState.
+                destination_expr = n.args[1]
+                pointer = yield from self._eval(destination_expr)
+                if not pointer.ctype.ptr:
+                    raise MemscopeError("scanf destination must be an address such as &n")
+                address = pointer.v
+                ctype = pointer.ctype.pointee()
+                target = source_text(destination_expr)
+                if target.startswith("&"):
+                    target = target[1:]
+                variable = next((v for v in reversed(s.variables)
+                                 if v.addr == address), None)
+                fmt = n.args[0].v
+                if fmt == "%d" and (ctype.ptr or ctype.base != "int"):
+                    raise MemscopeError("scanf %d destination must be an int")
+                if fmt == "%s" and (ctype.base != "char" or not variable or not variable.is_array):
+                    raise MemscopeError("scanf %s destination must be a char array")
+                if fmt == "%s":
+                    while True:
+                        while s.input_cursor >= len(s.input_values):
+                            emit(s, "INPUT_REQUEST", format="%s", destination=target, address=address)
+                            yield
+                        raw = str(s.input_values[s.input_cursor])
+                        if raw and "\x00" not in raw:
+                            break
+                        emit(s, "INPUT_REQUEST", format="%s", destination=target,
+                             address=address, error="Please enter a non-empty string.")
+                        yield
+                    encoded = decode_c_escapes(raw).encode("latin1")
+                    if len(encoded) + 1 > variable.count:
+                        emit(s, "INPUT_REQUEST", format="%s", destination=target,
+                             address=address, error=f"String is too long for {target}.")
+                        yield
+                        return Val(0, INT, "scanf")
+                    s.input_cursor += 1
+                    emit(s, "INPUT_RECEIVED", format="%s", destination=target,
+                         address=address, value=raw)
+                    for offset, byte in enumerate(encoded + b"\0"):
+                        s.memory.write_byte(address + offset, byte)
+                        emit(s, "MEMORY_WRITE", addr=address + offset, size=1, value=byte,
+                             target=f"{target}[{offset}]", **{"from": "input"})
+                    yield
+                    return Val(1, INT, "scanf")
+                while True:
+                    while s.input_cursor >= len(s.input_values):
+                        emit(s, "INPUT_REQUEST", format="%d", destination=target,
+                             address=address)
+                        # The replay driver stops at this yield. A later browser request
+                        # supplies another input queue and resumes the same language path.
+                        yield
+                    raw = s.input_values[s.input_cursor]
+                    if re.fullmatch(r"[+-]?\d+", str(raw).strip()):
+                        break
+                    emit(s, "INPUT_REQUEST", format="%d", destination=target,
+                         address=address, error="Please enter a whole number.")
+                    yield
+                value = int(str(raw).strip())
+                s.input_cursor += 1
+                emit(s, "INPUT_RECEIVED", format="%d", destination=target,
+                     address=address, value=value)
+                old = s.memory.read_value(ctype, address)
+                s.memory.write_value(ctype, address, value)
+                stored = s.memory.read_value(ctype, address)
+                emit(s, "MEMORY_WRITE", addr=address, size=ctype.size(), value=stored,
+                     target=target, **{"from": "input"})
+                if variable is not None:
+                    emit(s, "VARIABLE_UPDATE", name=variable.name, old=old, value=stored)
+                    self._after_write(variable)
+                yield
+                return Val(1, INT, "scanf")
             args = []
             for arg in n.args:
                 args.append((yield from self._eval(arg)))
@@ -1351,6 +1488,8 @@ class Interpreter:
 #  FUNCTION_CALL           a user function was entered                   push stack frame card
 #  FUNCTION_RETURN         a user function returned                      return-value chip, pop frame
 #  OUTPUT                  printf wrote text                             typewriter output panel
+#  INPUT_REQUEST           scanf needs browser input                     show the input panel / pause
+#  INPUT_RECEIVED          scanf accepted a value                        resume and show the write
 #  ERROR                   the user's program crashed                    show the message
 #
 # `emit` is the ONLY function that appends to state.events.
@@ -1431,6 +1570,10 @@ def explain(state: ProgramState, events: list[dict]) -> str:
                 parts.append(f"{verb} {e['value']} into {e['target']} ({hex(e['addr'])}).")
         elif t == "OUTPUT":
             parts.append(f"printf printed {json.dumps(e['text'])}.")
+        elif t == "INPUT_REQUEST":
+            parts.append(f"Input required: {e.get('format', '%d')} for {e.get('destination', 'destination')}.")
+        elif t == "INPUT_RECEIVED":
+            parts.append(f"Received {e['value']} for {e.get('destination', 'destination')}.")
         elif t == "REACTIVE_UPDATE":
             parts.append(f"{e['name']} recalculated: {e['old']} \u2192 {e['value']}.")
     if not parts:   # a pure "compute" step: say what was read
@@ -1450,8 +1593,30 @@ def explain(state: ProgramState, events: list[dict]) -> str:
 # ============================================
 # 10. OUTPUT HANDLING
 # ============================================
-def format_printf(fmt: str, args: list[Val]) -> str:
-    """Expand a printf format string. Supported: %d (decimal), %c (character), %x (hex), %%.
+def decode_c_escapes(text: str) -> str:
+    """Decode the small escape set supported by the C-subset lexer/runtime."""
+    return (text.replace("\\n", "\n").replace("\\t", "\t")
+                .replace("\\0", "\0").replace('\\"', '"').replace("\\'", "'")
+                .replace("\\\\", "\\"))
+
+
+def read_c_string(state: ProgramState, address: int, limit: int = MEM_SIZE,
+                  record_events: bool = False) -> str:
+    """Read a null-terminated char sequence from simulated memory."""
+    chars = []
+    for offset in range(limit):
+        byte = state.memory.read_byte(address + offset)
+        if record_events:
+            emit(state, "MEMORY_READ", addr=address + offset, size=1, value=byte,
+                 source=f"string[{offset}]")
+        if byte == 0:
+            break
+        chars.append(chr(byte))
+    return "".join(chars)
+
+
+def format_printf(fmt: str, args: list[Val], state: Optional[ProgramState] = None) -> str:
+    """Expand printf formats including decimal, character, string, hex, and percent output.
     Also the escapes \\n, \\t, \\\". Raises MemscopeError if an argument is missing.
     The caller appends the result to state.output and emits an OUTPUT event."""
     it = iter(args)
@@ -1468,10 +1633,14 @@ def format_printf(fmt: str, args: list[Val]) -> str:
             return str(arg.v)
         if spec == "c":
             return chr(arg.v & 0xFF)
+        if spec == "s":
+            if state is None or not arg.ctype.ptr or arg.ctype.base != "char":
+                raise MemscopeError("printf %s needs a char pointer or array")
+            return read_c_string(state, arg.v, record_events=True)
         return format(arg.v & 0xFFFFFFFF, "x")
 
-    text = re.sub(r"%([dcx%])", substitute, fmt)
-    return text.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    text = re.sub(r"%([dcsx%])", substitute, fmt)
+    return decode_c_escapes(text)
 
 
 # ============================================
@@ -1520,6 +1689,7 @@ h2 .seg{margin-left:auto;display:flex;gap:4px}h2 .seg button{padding:2px 8px;fon
 #bl{display:none;padding:8px 16px;overflow:auto}.blk{display:block;width:100%;text-align:left;margin:4px 0;border:0;border-left:7px solid var(--c);border-radius:4px 16px 16px 4px;background:#1a2438}
 #bl h3{margin:14px 0 2px;font-size:12px;color:var(--d);font-weight:600}
 #now{padding:10px 16px;border-bottom:1px solid var(--l);min-height:92px}#now code{display:block;color:var(--am);margin-bottom:4px}
+#inputPanel{display:none;margin:10px 16px;padding:10px 12px;border:1.5px solid var(--am);border-radius:6px;background:#18233a}#inputPanel b{display:block;color:var(--am)}#inputPrompt{color:var(--d);font-family:"JetBrains Mono",monospace}#inputRow{display:flex;gap:8px;margin-top:8px}#inputValue{flex:1;min-width:0;background:#0d1320;color:var(--t);border:1px solid var(--l);padding:6px 8px;border-radius:4px}#inputError{color:#ff8fa3;font-size:12px;min-height:1.2em;margin-top:4px}
 .var{padding:6px 16px;border-left:3px solid var(--c);margin-bottom:6px;cursor:pointer}.var.dead{opacity:.6}.var.hl{background:#18233a}
 .vh{display:flex;gap:8px;align-items:baseline}.vh b{color:var(--c);font-size:16px}.vh span{color:var(--d)}.vh code{margin-left:auto;font-size:14px}
 input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:flex;justify-content:space-between;font-size:10px;color:var(--d)}
@@ -1567,7 +1737,7 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 <section><h2>Program<span class="seg"><button id="t1" class="on">Code</button><button id="t2">Blocks</button></span></h2>
 <div id="ed"><div id="gut"><div id="gin"></div></div><div id="cw"><div id="lay"><div id="bar" style="display:none"></div><div id="nx"></div><pre id="hi"></pre></div><textarea id="ta" spellcheck="false" aria-label="C code"></textarea></div></div>
 <div id="bl"></div></section>
-<section><div id="now"></div><h2>Variables</h2><div id="vars"></div><h2>Stack</h2><div id="stack"></div></section>
+<section><div id="now"></div><div id="inputPanel"><b>Input required</b><span id="inputPrompt"></span><div id="inputRow"><input id="inputValue" type="text" inputmode="numeric" autocomplete="off"><button id="inputSubmit">Enter</button></div><div id="inputError"></div></div><h2>Variables</h2><div id="vars"></div><h2>Stack</h2><div id="stack"></div></section>
 <section><h2>Memory<span class="mono" style="color:var(--d);font-size:11px">little-endian · 4-byte pointers</span><span class="seg" id="rp"></span></h2>
 <div id="stage"></div><div id="arrv"></div><div id="mem"><div id="rows"></div><svg id="ar"></svg></div><div id="info"></div></section>
 </main>
@@ -1593,30 +1763,40 @@ const MEMSZ=512;
 let S=null,nSteps=0,busy=false,running=false,epoch=0,E=[],RD=new Set(),vw=null,vn=null,vfr=null,vvs=null,rt=null,propv=null;
 /* Checkpoints are serialized snapshots returned by the interpreter API.  They are the
    same state the renderer uses, rather than a second UI execution model. */
-let history=[],historyPos=0;
+let history=[],historyPos=0,inputValues=[],pendingInput=null,resumeAfterInput=false;
 const emptyState=()=>({mem:new Uint8Array(MEMSZ),vars:[],frames:[],call_stack:[],next_frame_id:0,node_visits:0,out:'',line:0,sp:BASE,done:false,ok:false,E:[]});
 /* Decode helpers: turn the authoritative bytes in `mem` into numbers for display (little-endian). */
 const readU=(a,n)=>{let v=0;for(let i=n-1;i>=0;i--)v=v*256+mem[a-BASE+i];return v};
 const rdv=(t,a)=>t.ptr?readU(a,4):t.b==='char'?(x=>x>127?x-256:x)(readU(a,1)):(u=>u>=2**31?u-2**32:u)(readU(a,4));
-const val=v=>v.arr?'{'+Array.from({length:v.cnt},(_,k)=>rdv(v.t,v.a+k*sz(v.t))).join(', ')+'}':v.t.ptr?hx(rdv(v.t,v.a)):rdv(v.t,v.a);
+const charText=v=>{let s='';for(let k=0;k<v.cnt;k++){const n=rdv(v.t,v.a+k);if(n===0)break;s+=String.fromCharCode(n&255)}return s};
+const val=v=>v.arr&&v.t.b==='char'?'"'+esc(charText(v))+'"':v.arr?'{'+Array.from({length:v.cnt},(_,k)=>rdv(v.t,v.a+k*sz(v.t))).join(', ')+'}':v.t.ptr?hx(rdv(v.t,v.a)):rdv(v.t,v.a);
 const isMove=e=>e.type==='MEMORY_WRITE'&&/^\w+\[\d+\]$/.test(e.from||'')&&/^\w+\[\d+\]$/.test(e.target||'');
-async function api(steps){const r=await fetch('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:$('ta').value,steps})});return r.json()}
+async function api(steps){const r=await fetch('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:$('ta').value,steps,inputs:inputValues})});return r.json()}
 function applyState(d){S={mem:Uint8Array.from(d.state.mem),vars:d.state.vars,frames:d.state.frames,call_stack:d.state.call_stack||[],next_frame_id:d.state.next_frame_id||0,node_visits:d.state.node_visits||0,out:d.state.out,line:d.state.line,sp:d.state.sp,done:d.done,ok:true,E:d.events||[]};mem=S.mem;vars=S.vars;E=S.E}
+function showInputRequest(ev){
+  pendingInput=ev;$('inputPanel').style.display='block';$('inputPrompt').textContent=ev.format+' → '+(ev.destination||'destination');
+  $('inputError').textContent=ev.error||'';$('inputValue').value='';$('inputValue').focus();
+}
+function hideInputRequest(){pendingInput=null;$('inputPanel').style.display='none';$('inputError').textContent='';$('inputValue').value=''}
+function currentInputRequest(){return [...E].reverse().find(e=>e.type==='INPUT_REQUEST')}
 function checkpoint(d){return JSON.parse(JSON.stringify({state:d.state,done:d.done,events:d.events||[],explanation:d.explanation||'',changed:d.changed||[],step:d.executed||0}))}
 function restoreCheckpoint(cp){
   /* Restoring replaces the authoritative renderer state wholesale. Animations are cleared
      because reverse execution is a state restore, not an attempted inverse animation. */
-  fin(); applyState(cp); nSteps=cp.step; chg=new Set(cp.changed||[]); RD=new Set(); nw=null; propv=null;
-  cur=S.line?S.line-1:null; note=cp.explanation||('Restored step '+cp.step+'.'); render(1); updateHistoryControls();
+  fin(); applyState(cp); nSteps=cp.step; if(cp.state.input_cursor!=null)inputValues=inputValues.slice(0,cp.state.input_cursor); chg=new Set(cp.changed||[]); RD=new Set(); nw=null; propv=null;
+  cur=S.line?S.line-1:null; note=cp.explanation||('Restored step '+cp.step+'.'); render(1); const request=currentInputRequest(); if(request)showInputRequest(request); else hideInputRequest(); updateHistoryControls();
 }
 function updateHistoryControls(){
   $('prev').disabled=historyPos<=0;
-  $('next').disabled=!!(S&&S.done);
-  $('stepCount').textContent='Step '+historyPos+' / '+Math.max(0,history.length-1);
+  $('next').disabled=!!(S&&S.done)||!!pendingInput;
+  $('step').disabled=!!pendingInput||!!(S&&S.done);
+  const known=Math.max(nSteps,...history.map(h=>h.step||0));
+  $('stepCount').textContent='Step '+nSteps+' / '+known;
 }
 /* step(): ask for state after nSteps+1 steps, then animate the difference. Returns the step's events or null when finished. */
-async function step(){fin();if(busy||S.done||!S.ok){stop();return null}
- const ep=epoch;busy=true;let d;try{d=await api(historyPos+1)}catch(e){busy=false;stop();note='⚠ Could not reach the server: '+e.message;render(1);return null}busy=false;
+async function step(resolveInput=false){fin();if(busy||S.done||!S.ok||(pendingInput&&!resolveInput)){stop();return null}
+ const targetSteps=pendingInput?nSteps:nSteps+1;
+ const ep=epoch;busy=true;let d;try{d=await api(targetSteps)}catch(e){busy=false;stop();note='⚠ Could not reach the server: '+e.message;render(1);return null}busy=false;
  if(ep!==epoch)return null;
  if(d.error){S.done=true;note='⚠ '+d.error;stop();render(1);return null}
  if(!d.events.length){S.done=true;stop();render(1);return null}
@@ -1625,7 +1805,7 @@ async function step(){fin();if(busy||S.done||!S.ok){stop();return null}
  history=history.slice(0,historyPos+1);history.push(checkpoint(d));historyPos++;
  E.forEach(e=>{if(e.type==='MEMORY_READ'){const o=S.vars.find(v=>e.addr>=v.a&&e.addr<v.a+sz(v.t)*v.cnt);o&&RD.add(o.n)}if(e.type==='VARIABLE_CREATE')nw=S.vars.find(v=>v.a===e.address&&v.n===e.name)});
  const dd=[...E].reverse().find(e=>e.type==='POINTER_DEREFERENCE');if(dd)sel=dd.addr;
- note=d.explanation;present(b);updateHistoryControls();if(S.done)stop();return E}
+ note=d.explanation;present(b);const request=currentInputRequest();if(request){resumeAfterInput=running;showInputRequest(request);stop()}else if(E.some(e=>e.type==='INPUT_RECEIVED'))hideInputRequest();updateHistoryControls();if(S.done)stop();return E}
 async function previousStep(){
   if(busy||historyPos<=0)return;
   stop(); historyPos--; restoreCheckpoint(history[historyPos]);
@@ -1634,11 +1814,23 @@ async function nextStep(){
   if(busy||S.done)return;
   await step();
 }
+async function submitInput(){
+  if(!pendingInput||busy)return;
+  const raw=$('inputValue').value.trim();
+  if(!/^[+-]?\d+$/.test(raw)){$('inputError').textContent='Please enter a whole number.';$('inputValue').focus();return}
+  inputValues.push(raw);
+  const before=inputValues.length;
+  const events=await step(true); const resume=resumeAfterInput; resumeAfterInput=false;
+  if(!events||events.some(e=>e.type==='INPUT_REQUEST'&&e.error)){
+    // Keep the request active if the server rejected the submitted value.
+    if(inputValues.length===before)inputValues.pop();
+  } else if(resume){$('run').click()}
+}
 function stop(){running=false;$('pause').classList.remove('on')}
 function fin(){if(rt){clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;render(1)}}
 function present(b){const ms=E.some(e=>e.type==='BINARY_OPERATION')?2000:E.some(isMove)?1100:0;
  if(ms){vw=b.m;vn=b.n;vfr=b.fr;vvs=b.vs;render();rt=setTimeout(()=>{rt=null;vw=vn=vfr=vvs=null;render(1)},ms)}else render()}
-async function reset(){stop();clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;propv=null;clearInterval(ty);epoch++;nSteps=0;history=[];historyPos=0;S=emptyState();mem=S.mem;vars=S.vars;E=S.E;RD=new Set();shown=0;cur=null;pf=0;sel=nw=hlv=null;chg=new Set();for(const k in AR)delete AR[k];
+async function reset(){stop();hideInputRequest();resumeAfterInput=false;clearTimeout(rt);rt=null;vw=vn=vfr=vvs=null;propv=null;clearInterval(ty);epoch++;nSteps=0;history=[];historyPos=0;inputValues=[];S=emptyState();mem=S.mem;vars=S.vars;E=S.E;RD=new Set();shown=0;cur=null;pf=0;sel=nw=hlv=null;chg=new Set();for(const k in AR)delete AR[k];
  note='Press Step or Run. Each action the program takes changes memory in a way you can see.';render();
  try{const d=await api(0);if(d.error){S.done=true;note='⚠ '+d.error}else{applyState(d);history=[checkpoint(d)];historyPos=0}}catch(e){S.done=true;note='⚠ Could not reach the server: '+e.message}render();updateHistoryControls()}
 function hl(s){return esc(s).replace(/(\/\/.*)|("(?:[^"\\]|\\.)*")|\b(int|char|return|for)\b|\b(\d+)\b|\b(printf|main)\b/g,(m,c,q,k,n,f)=>`<span class="${c?'c':q?'s':k?'k':n?'n':'f'}">${m}</span>`)}
@@ -1689,11 +1881,41 @@ function ins(code){const t=$('ta'),L=t.value.split('\n'),m=/main\(\)/.test(t.val
 function tab(c){$('ed').style.display=c?'flex':'none';$('bl').style.display=c?'none':'block';$('t1').className=c?'on':'';$('t2').className=c?'':'on'}
 $('ta').oninput=()=>{sync();reset()};
 $('ta').onscroll=e=>{const t=e.target;$('lay').style.transform=`translate(${-t.scrollLeft}px,${-t.scrollTop}px)`;$('gin').style.transform=`translateY(${-t.scrollTop}px)`};
+/* Lightweight VS Code-style pairing for the existing textarea editor. The textarea remains
+   the real source buffer; these edits only adjust its text and selection, then use the same
+   sync/reset path as ordinary typing. */
+$('ta').onkeydown=e=>{
+ const t=e.currentTarget, pairs={'(':')','[':']','{':'}','"':'"',"'":"'"};
+ const opens=Object.keys(pairs), closes=Object.values(pairs), start=t.selectionStart, end=t.selectionEnd, text=t.value;
+ if(e.ctrlKey||e.metaKey||e.altKey)return;
+ const replace=(value,caret)=>{e.preventDefault();t.value=value;t.selectionStart=t.selectionEnd=caret;sync();reset()};
+ if(closes.includes(e.key)&&start===end&&text[start]===e.key){
+   // The close character was inserted by its opener; move over it instead of duplicating it.
+   e.preventDefault();t.selectionStart=t.selectionEnd=start+1;return;
+ }
+ if(opens.includes(e.key)){
+   const close=pairs[e.key];
+   replace(text.slice(0,start)+e.key+close+text.slice(end),start+1);
+   return;
+ }
+ if(e.key==='Backspace'&&start===end&&start>0&&start<text.length&&pairs[text[start-1]]===text[start]){
+   // Delete an untouched empty pair as one unit.
+   replace(text.slice(0,start-1)+text.slice(start+1),start-1);return;
+ }
+ if(e.key==='Enter'&&start===end&&text[start-1]==='{'&&text[start]==='}'){
+   const lineStart=text.lastIndexOf('\n',start-1)+1;
+   const indent=(text.slice(lineStart,start).match(/^[ \t]*/) || [''])[0];
+   const inner='\n'+indent+'    '+'\n'+indent;
+   replace(text.slice(0,start)+inner+text.slice(start),start+1+indent.length+4);return;
+ }
+};
 $('step').onclick=()=>{stop();step()};$('reset').onclick=reset;
 $('prev').onclick=previousStep;$('next').onclick=nextStep;
+$('inputSubmit').onclick=submitInput;
+$('inputValue').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();submitInput()}};
 $('pause').onclick=()=>stop();
 $('run').onclick=async()=>{if(running)return;if(S.done)await reset();running=true;$('pause').classList.add('on');
- while(running){const e=await step();if(!e||S.done)break;await new Promise(r=>setTimeout(r,e.some(x=>x.type==='BINARY_OPERATION'||isMove(x))?2400:1100))}stop()};
+ while(running){const e=await step();if(!e||S.done||e.some(x=>x.type==='INPUT_REQUEST'))break;await new Promise(r=>setTimeout(r,e.some(x=>x.type==='BINARY_OPERATION'||isMove(x))?2400:1100))}stop()};
 $('rp').innerHTML=['HEX','DEC','BIN','ASCII'].map(r=>`<button data-r="${r}" class="${r===repr?'on':''}">${r}</button>`).join('');
 $('rp').onclick=e=>{const r=e.target.dataset.r;if(!r)return;repr=r;[...$('rp').children].forEach(b=>b.className=b.dataset.r===r?'on':'');rMem()};
 $('rows').onclick=e=>{const c=e.target.closest('.cell');if(c){sel=+c.dataset.a;rMem();rInfo()}};
@@ -1722,7 +1944,7 @@ $('ta').value=STARTER;sync();reset();tick();
 app = Flask(__name__)     # Vercel looks for a module-level variable called `app`.
 
 
-def run_program(source: str, steps: int) -> dict:
+def run_program(source: str, steps: int, inputs: Optional[list[str]] = None) -> dict:
     """Parse `source`, replay it for `steps` steps from the beginning, and describe the result.
 
     Why replay: the server keeps no session. Replaying is deterministic and cheap for teaching-size
@@ -1739,7 +1961,7 @@ def run_program(source: str, steps: int) -> dict:
     if len(source) > MAX_SOURCE_CHARS:
         raise MemscopeError("Program is too long")
     program = Parser(tokenize(source)).parse_program()
-    interp = Interpreter(program)
+    interp = Interpreter(program, inputs or [])
     state = interp.state
     executed, events, changed = 0, [], []
     for _ in range(min(steps, MAX_STEPS)):
@@ -1750,6 +1972,10 @@ def run_program(source: str, steps: int) -> dict:
             break
         executed, events = executed + 1, step_events
         changed = [MEM_BASE + i for i, (a, b) in enumerate(zip(before, state.memory.data)) if a != b]
+        # INPUT_REQUEST is a real execution boundary. Do not replay beyond scanf
+        # until the browser supplies a value in a subsequent request.
+        if any(e.get("type") == "INPUT_REQUEST" for e in step_events):
+            break
     return {
         "executed": executed,
         "done": state.done,
@@ -1766,6 +1992,7 @@ def run_program(source: str, steps: int) -> dict:
             "call_stack": list(state.call_stack),
             "next_frame_id": state.next_frame_id,
             "node_visits": state.node_visits,
+            "input_cursor": state.input_cursor,
             "out": state.output,
             "line": state.line,
             "sp": state.memory.sp,
@@ -1781,15 +2008,17 @@ def index() -> Response:
 
 @app.post("/api/execute")
 def api_execute():
-    """Body: {"source": "<C code>", "steps": N}. Response: see run_program().
+    """Body: {"source": "<C code>", "steps": N, "inputs": [...]}. Response: see run_program().
     User-program errors (syntax errors) come back as {"error": "..."} with HTTP 200 because they are
     expected input problems, not server failures."""
     data = request.get_json(silent=True) or {}
-    source, steps = data.get("source"), data.get("steps", 0)
+    source, steps, inputs = data.get("source"), data.get("steps", 0), data.get("inputs", [])
     if not isinstance(source, str) or not isinstance(steps, int) or steps < 0:
         return jsonify({"error": "Expected JSON like {\"source\": \"...\", \"steps\": 3}"}), 400
+    if not isinstance(inputs, list) or any(not isinstance(x, (str, int)) for x in inputs):
+        return jsonify({"error": "inputs must be a list of submitted values"}), 400
     try:
-        return jsonify(run_program(source, steps))
+        return jsonify(run_program(source, steps, [str(x) for x in inputs]))
     except MemscopeError as err:
         return jsonify({"error": str(err)})
 
