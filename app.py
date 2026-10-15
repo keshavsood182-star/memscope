@@ -1580,7 +1580,9 @@ const $=id=>document.getElementById(id),BASE=0x1000,COL=['#6cb8ff','#b58cff','#f
    and Run/Step/Reset always use whatever is in the editor at that moment. */
 const STARTER='int main() {\n    int a = 10;\n    int b = 20;\n    int c = a + b;\n    return 0;\n}';
 const BL=[['Variables','#6cb8ff',[['set a to 130','int a = 130;'],['change a by 1','a = a + 1;'],['set b to a + 10','int b = a + 10;']]],['Pointers','#ffb347',[['create pointer to a','char *ptr = (char *)&a;'],['move pointer one step','ptr++;'],['set value at pointer to 0','*ptr = 0;']]],['Arrays','#7be0a0',[['array of 4 numbers','int nums[4] = {10, 20, 30, 40};']]],['Output','#ff8fa3',[['print a','printf("%d", a);'],['print value at pointer','printf("%d", *ptr);']]],['Control (not simulated yet)','#8493b3',[['repeat 3 times','// repeat 3 { ... }'],['if a > 100','// if a > 100 { ... }']]]];
-let mem,vars,out,shown,pc,cur,frame,pf,sel,rdd,chg,nw,note,hlv,nextA,timer,ty,repr='HEX';const AR={};
+// Decimal is the teaching-friendly default for stored values. Addresses and pointer
+// targets continue to use hx(), while the selector still lets users choose DEC/HEX/BIN/ASCII.
+let mem,vars,out,shown,pc,cur,frame,pf,sel,rdd,chg,nw,note,hlv,nextA,timer,ty,repr='DEC';const AR={};
 const sz=t=>t.ptr||t.b==='int'?4:1,pt=t=>({b:t.b,ptr:false}),tn=t=>t.b+(t.ptr?' *':''),hx=n=>'0x'+n.toString(16),H=n=>n.toString(16).toUpperCase().padStart(2,'0');
 const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;'),isEx=s=>{s=s.trim();return s&&s!=='}'&&!/^(\/\/|#|int main)/.test(s)};
 /* ===== ENGINE CLIENT (replaces the old in-browser engine) =====
