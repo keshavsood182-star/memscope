@@ -1887,7 +1887,9 @@ function rStack(){view(()=>{const F=vfr||S.frames,V=VV();$('stack').innerHTML=F.
 function rEd(){const L=$('ta').value.split('\n'),b=$('bar'),n=$('nx');b.style.display=cur==null?'none':'block';b.style.top=12+(cur||0)*22+'px';n.style.display='none'}
 function rNow(){const L=$('ta').value.split('\n');$('now').innerHTML='<small>What just happened</small>'+(cur==null||propv?'':`<code>line ${cur+1}: ${esc(L[cur].trim())}</code>`)+esc(note)+(propv?`<div class="pr">${propv.map((p,k)=>`${k?'<i>↓</i>':''}<span style="animation-delay:${k*.4}s"><b>${p.n}</b> ${p.o} → ${p.v}</span>`).join('')}</div>`:'')}
 function rArr(){view(()=>{const V=VV(),tg=V.filter(x=>!x.arr&&!x.t.ptr&&['i','j','k'].includes(x.n)).map(x=>[x.n,rdv(x.t,x.a)]),dv=V.find(x=>x.n==='deleteIndex');
- $('arrv').innerHTML=V.filter(v=>v.arr).map(v=>{const n=lg(v);let b='';
+ /* Character arrays have their own compact STRING VIEW; keeping them out of
+    the generic array panel avoids rendering all unused char[100] cells twice. */
+ $('arrv').innerHTML=V.filter(v=>v.arr&&!isStringVar(v)).map(v=>{const n=lg(v);let b='';
   for(let k=0;k<v.cnt;k++)b+=`<div class="ab${k>=n?' stale':''}${dv&&rdv(dv.t,dv.a)===k?' del':''}" data-k="${v.n}:${k}"><b>${rdv(v.t,v.a+k*sz(v.t))}</b><i>${k}</i><em>${tg.filter(t=>t[1]===k).map(t=>t[0]).join(' ')}</em>${dv&&rdv(dv.t,dv.a)===k&&k<n?'<u class="dx">✕ delete</u>':''}${k>=n?'<small>stale</small>':''}</div>`;
   const live=Array.from({length:n},(_,k)=>rdv(v.t,v.a+k*sz(v.t)));
   return`<div class="av"><div class="avh"><b>${v.n}</b> logical length ${n}${n<v.cnt?` of ${v.cnt} slots`:''}${dv?` · deleteIndex = ${rdv(dv.t,dv.a)}`:''}</div><div class="abs">${b}</div><div class="avl">logical array: [${live.join(', ')}]</div></div>`}).join('')})}
