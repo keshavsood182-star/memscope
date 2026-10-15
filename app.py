@@ -179,6 +179,8 @@ class ProgramState:
         self.input_values: list[str] = []
         self.input_cursor = 0
         self.string_literals: dict[str, int] = {}
+        self.execution_state = "RUNNING"
+        self.waiting_for_input: Optional[dict] = None
         # --- transient flags used while evaluating one expression ---
         self.quiet = 0                          # >0: evaluate silently (no events); used for reactive re-evaluation
         self.index_depth = 0                    # >0: we are inside `[...]` -> arithmetic is INDEX arithmetic
@@ -1401,21 +1403,31 @@ class Interpreter:
                 if fmt == "%s":
                     while True:
                         while s.input_cursor >= len(s.input_values):
+                            s.execution_state = "WAITING_FOR_INPUT"
+                            s.waiting_for_input = {"format": "%s", "target": target, "address": address}
                             emit(s, "INPUT_REQUEST", format="%s", destination=target, address=address)
                             yield
                         raw = str(s.input_values[s.input_cursor])
                         if raw and "\x00" not in raw:
                             break
+                        s.execution_state = "WAITING_FOR_INPUT"
+                        s.waiting_for_input = {"format": "%s", "target": target, "address": address,
+                                               "error": "Please enter a non-empty string."}
                         emit(s, "INPUT_REQUEST", format="%s", destination=target,
                              address=address, error="Please enter a non-empty string.")
                         yield
                     encoded = decode_c_escapes(raw).encode("latin1")
                     if len(encoded) + 1 > variable.count:
+                        s.execution_state = "WAITING_FOR_INPUT"
+                        s.waiting_for_input = {"format": "%s", "target": target, "address": address,
+                                               "error": f"String is too long for {target}."}
                         emit(s, "INPUT_REQUEST", format="%s", destination=target,
                              address=address, error=f"String is too long for {target}.")
                         yield
                         return Val(0, INT, "scanf")
                     s.input_cursor += 1
+                    s.execution_state = "RUNNING"
+                    s.waiting_for_input = None
                     emit(s, "INPUT_RECEIVED", format="%s", destination=target,
                          address=address, value=raw)
                     for offset, byte in enumerate(encoded + b"\0"):
@@ -1426,6 +1438,8 @@ class Interpreter:
                     return Val(1, INT, "scanf")
                 while True:
                     while s.input_cursor >= len(s.input_values):
+                        s.execution_state = "WAITING_FOR_INPUT"
+                        s.waiting_for_input = {"format": "%d", "target": target, "address": address}
                         emit(s, "INPUT_REQUEST", format="%d", destination=target,
                              address=address)
                         # The replay driver stops at this yield. A later browser request
@@ -1434,11 +1448,16 @@ class Interpreter:
                     raw = s.input_values[s.input_cursor]
                     if re.fullmatch(r"[+-]?\d+", str(raw).strip()):
                         break
+                    s.execution_state = "WAITING_FOR_INPUT"
+                    s.waiting_for_input = {"format": "%d", "target": target, "address": address,
+                                           "error": "Please enter a whole number."}
                     emit(s, "INPUT_REQUEST", format="%d", destination=target,
                          address=address, error="Please enter a whole number.")
                     yield
                 value = int(str(raw).strip())
                 s.input_cursor += 1
+                s.execution_state = "RUNNING"
+                s.waiting_for_input = None
                 emit(s, "INPUT_RECEIVED", format="%d", destination=target,
                      address=address, value=value)
                 old = s.memory.read_value(ctype, address)
@@ -1715,6 +1734,7 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 #rows.bin .cell{width:98px}#rows.bin .row{min-width:max-content}.cell b.bn{display:grid;grid-template-columns:repeat(8,1fr);font-size:12px;font-weight:600}.bn span{text-align:center}.bits span{min-width:0}
+.sv{margin:8px 16px 12px;padding:10px 12px;border:1px solid var(--l);border-left:3px solid var(--mi);border-radius:5px;background:#121c2d}.svh{display:flex;align-items:baseline;gap:8px}.svh b{font-size:17px;color:var(--mi)}.svh span{color:var(--d);font-size:11px}.svcells{display:flex;gap:3px;margin:8px 0 3px;overflow-x:auto}.svc{min-width:42px;border:1px solid var(--mi);padding:4px 3px;text-align:center}.svc b{display:block;font-size:15px;color:var(--t)}.svc i{display:block;font:10px "JetBrains Mono",monospace;color:var(--d);font-style:normal}.svmeta{color:var(--d);font-size:11px}.svbytes{font:11px "JetBrains Mono",monospace;color:var(--am);margin-top:4px;word-break:break-all}.sv button{padding:2px 7px;font-size:11px;margin-left:auto}
 .grp.stale{opacity:.4}.grp.stale .cell{border-style:dashed}.row.read{outline:1.5px solid var(--am);outline-offset:-1px}
 #now small{display:block;color:var(--d);font-size:11px;margin-bottom:2px}.fm{font-size:11px;color:var(--d);margin:2px 0}
 .pr{display:flex;flex-direction:column;align-items:flex-start;margin-top:6px}.pr span{border:1.5px solid var(--mi);padding:1px 8px;font:13px "JetBrains Mono",monospace;animation:mv .5s both}.pr i{color:var(--mi);font-style:normal;padding-left:10px}.pr b{color:var(--mi)}
@@ -1737,9 +1757,9 @@ input[type=range]{width:100%;accent-color:var(--c);margin:4px 0 0}.sl{display:fl
 <section><h2>Program<span class="seg"><button id="t1" class="on">Code</button><button id="t2">Blocks</button></span></h2>
 <div id="ed"><div id="gut"><div id="gin"></div></div><div id="cw"><div id="lay"><div id="bar" style="display:none"></div><div id="nx"></div><pre id="hi"></pre></div><textarea id="ta" spellcheck="false" aria-label="C code"></textarea></div></div>
 <div id="bl"></div></section>
-<section><div id="now"></div><div id="inputPanel"><b>Input required</b><span id="inputPrompt"></span><div id="inputRow"><input id="inputValue" type="text" inputmode="numeric" autocomplete="off"><button id="inputSubmit">Enter</button></div><div id="inputError"></div></div><h2>Variables</h2><div id="vars"></div><h2>Stack</h2><div id="stack"></div></section>
+<section><div id="now"></div><div id="inputPanel"><b>WAITING FOR INPUT</b><span id="inputPrompt"></span><div id="inputRow"><input id="inputValue" type="text" autocomplete="off"><button id="inputSubmit">Enter</button></div><div id="inputError"></div></div><h2>Variables</h2><div id="vars"></div><h2>Stack</h2><div id="stack"></div></section>
 <section><h2>Memory<span class="mono" style="color:var(--d);font-size:11px">little-endian · 4-byte pointers</span><span class="seg" id="rp"></span></h2>
-<div id="stage"></div><div id="arrv"></div><div id="mem"><div id="rows"></div><svg id="ar"></svg></div><div id="info"></div></section>
+<div id="stage"></div><div id="arrv"></div><div id="stringViews"></div><div id="mem"><div id="rows"></div><svg id="ar"></svg></div><div id="info"></div></section>
 </main>
 <footer id="out"><span>Output</span><div id="ot"></div></footer>
 <script>
@@ -1760,11 +1780,11 @@ const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;'),isEx=s=>{s=s.trim();re
    1) asks the server for "state after N steps", 2) decodes memory bytes for display, 3) draws.
    S mirrors the server's ProgramState snapshot; nothing here executes C or keeps its own variable values. */
 const MEMSZ=512;
-let S=null,nSteps=0,busy=false,running=false,epoch=0,E=[],RD=new Set(),vw=null,vn=null,vfr=null,vvs=null,rt=null,propv=null;
+let S=null,nSteps=0,busy=false,running=false,epoch=0,E=[],RD=new Set(),vw=null,vn=null,vfr=null,vvs=null,rt=null,propv=null,showAllStrings=false;
 /* Checkpoints are serialized snapshots returned by the interpreter API.  They are the
    same state the renderer uses, rather than a second UI execution model. */
 let history=[],historyPos=0,inputValues=[],pendingInput=null,resumeAfterInput=false;
-const emptyState=()=>({mem:new Uint8Array(MEMSZ),vars:[],frames:[],call_stack:[],next_frame_id:0,node_visits:0,out:'',line:0,sp:BASE,done:false,ok:false,E:[]});
+const emptyState=()=>({mem:new Uint8Array(MEMSZ),vars:[],frames:[],call_stack:[],next_frame_id:0,node_visits:0,input_cursor:0,execution_state:'RUNNING',waiting_for_input:null,out:'',line:0,sp:BASE,done:false,ok:false,E:[]});
 /* Decode helpers: turn the authoritative bytes in `mem` into numbers for display (little-endian). */
 const readU=(a,n)=>{let v=0;for(let i=n-1;i>=0;i--)v=v*256+mem[a-BASE+i];return v};
 const rdv=(t,a)=>t.ptr?readU(a,4):t.b==='char'?(x=>x>127?x-256:x)(readU(a,1)):(u=>u>=2**31?u-2**32:u)(readU(a,4));
@@ -1772,13 +1792,13 @@ const charText=v=>{let s='';for(let k=0;k<v.cnt;k++){const n=rdv(v.t,v.a+k);if(n
 const val=v=>v.arr&&v.t.b==='char'?'"'+esc(charText(v))+'"':v.arr?'{'+Array.from({length:v.cnt},(_,k)=>rdv(v.t,v.a+k*sz(v.t))).join(', ')+'}':v.t.ptr?hx(rdv(v.t,v.a)):rdv(v.t,v.a);
 const isMove=e=>e.type==='MEMORY_WRITE'&&/^\w+\[\d+\]$/.test(e.from||'')&&/^\w+\[\d+\]$/.test(e.target||'');
 async function api(steps){const r=await fetch('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:$('ta').value,steps,inputs:inputValues})});return r.json()}
-function applyState(d){S={mem:Uint8Array.from(d.state.mem),vars:d.state.vars,frames:d.state.frames,call_stack:d.state.call_stack||[],next_frame_id:d.state.next_frame_id||0,node_visits:d.state.node_visits||0,out:d.state.out,line:d.state.line,sp:d.state.sp,done:d.done,ok:true,E:d.events||[]};mem=S.mem;vars=S.vars;E=S.E}
+function applyState(d){S={mem:Uint8Array.from(d.state.mem),vars:d.state.vars,frames:d.state.frames,call_stack:d.state.call_stack||[],next_frame_id:d.state.next_frame_id||0,node_visits:d.state.node_visits||0,input_cursor:d.state.input_cursor||0,execution_state:d.state.execution_state||'RUNNING',waiting_for_input:d.state.waiting_for_input||null,out:d.state.out,line:d.state.line,sp:d.state.sp,done:d.done,ok:true,E:d.events||[]};mem=S.mem;vars=S.vars;E=S.E}
 function showInputRequest(ev){
-  pendingInput=ev;$('inputPanel').style.display='block';$('inputPrompt').textContent=ev.format+' → '+(ev.destination||'destination');
+  pendingInput=ev;$('inputPanel').style.display='block';$('inputPrompt').textContent=ev.format+' → '+(ev.target||ev.destination||'destination');
   $('inputError').textContent=ev.error||'';$('inputValue').value='';$('inputValue').focus();
 }
 function hideInputRequest(){pendingInput=null;$('inputPanel').style.display='none';$('inputError').textContent='';$('inputValue').value=''}
-function currentInputRequest(){return [...E].reverse().find(e=>e.type==='INPUT_REQUEST')}
+function currentInputRequest(){return S&&S.execution_state==='WAITING_FOR_INPUT'?S.waiting_for_input:null}
 function checkpoint(d){return JSON.parse(JSON.stringify({state:d.state,done:d.done,events:d.events||[],explanation:d.explanation||'',changed:d.changed||[],step:d.executed||0}))}
 function restoreCheckpoint(cp){
   /* Restoring replaces the authoritative renderer state wholesale. Animations are cleared
@@ -1817,13 +1837,17 @@ async function nextStep(){
 async function submitInput(){
   if(!pendingInput||busy)return;
   const raw=$('inputValue').value.trim();
-  if(!/^[+-]?\d+$/.test(raw)){$('inputError').textContent='Please enter a whole number.';$('inputValue').focus();return}
-  inputValues.push(raw);
+  if(pendingInput.format==='%d'&&!/^[+-]?\d+$/.test(raw)){$('inputError').textContent='Please enter a whole number.';$('inputValue').focus();return}
+  if(pendingInput.format==='%s'&&!raw){$('inputError').textContent='Please enter a string.';$('inputValue').focus();return}
+  /* Keep the queue transactional: a rejected value must not remain in the
+     replay input list, otherwise every retry would encounter the same bad
+     value before it could reach the newly submitted one. */
   const before=inputValues.length;
+  inputValues.push(raw);
   const events=await step(true); const resume=resumeAfterInput; resumeAfterInput=false;
   if(!events||events.some(e=>e.type==='INPUT_REQUEST'&&e.error)){
     // Keep the request active if the server rejected the submitted value.
-    if(inputValues.length===before)inputValues.pop();
+    if(inputValues.length>before)inputValues.pop();
   } else if(resume){$('run').click()}
 }
 function stop(){running=false;$('pause').classList.remove('on')}
@@ -1838,8 +1862,19 @@ const view=f=>{const M=mem;if(vw)mem=vw;try{return f()}finally{mem=M}},VV=()=>vv
 const lg=v=>{const x=VV().find(x=>x.n==='n'&&!x.arr);return x?Math.max(0,Math.min(v.cnt,rdv(x.t,x.a))):v.cnt};
 const bits8=b=>[...b.toString(2).padStart(8,'0')].map(c=>`<span>${c}</span>`).join('');
 const cellTxt=b=>repr==='HEX'?H(b):repr==='DEC'?b:repr==='BIN'?bits8(b):b>31&&b<127?esc(String.fromCharCode(b)):b?'·':'∅';
+const isStringVar=v=>v.arr&&v.t.b==='char';
+/* Keep the logical string view compact; the raw byte grid remains available
+   through the toggle for users who need the complete array capacity. */
+function stringView(v){
+ const bytes=[];for(let k=0;k<v.cnt;k++){const n=rdv(v.t,v.a+k);bytes.push(n);if(n===0)break}
+ const term=bytes.indexOf(0),active=term<0?bytes:bytes.slice(0,term);
+ const cells=bytes.map((n,k)=>`<div class="svc"><b>${n===0?'\\0':esc(String.fromCharCode(n&255))}</b><i>${k}</i></div>`).join('');
+ const hex=bytes.map(n=>H(n)).join(' '),text=active.map(n=>String.fromCharCode(n&255)).join('');
+ return `<div class="sv"><div class="svh"><b>${esc(v.n)}</b><span>char[${v.cnt}]</span><button data-string-toggle="1">${showAllStrings?'Hide':'Show all '+v.cnt+' bytes'}</button></div><div class="svcells">${cells||'<span class="svmeta">(empty)</span>'}</div><div class="svmeta">String: &quot;${esc(text)}&quot; · Length: ${active.length} · Capacity: ${v.cnt} · Terminator: ${term<0?'not found':'index '+term}</div><div class="svbytes">Active bytes (hex): ${hex||'(none)'}</div></div>`;
+}
 function rMem(){view(()=>{const ra=new Set();E.forEach(e=>{if(e.type==='MEMORY_READ')for(let j=0;j<e.size;j++)ra.add(e.addr+j)});let h='';
- VV().forEach((v,i)=>{const es=sz(v.t),ln=v.arr?lg(v):1e9;let gs='';
+ $('stringViews').innerHTML=VV().filter(isStringVar).map(stringView).join('');
+ VV().forEach((v,i)=>{if(isStringVar(v)&&!showAllStrings)return;const es=sz(v.t),ln=v.arr?lg(v):1e9;let gs='';
   for(let k=0;k<v.cnt;k++){const a=v.a+k*es;let cs='';for(let j=0;j<es;j++){const b=a+j;cs+=`<div class="cell${chg.has(b)?' chg':''}${sel===b?' sel':''}${ra.has(b)?' rd':''}" data-a="${b}"><b class="${repr==='BIN'?'bn':''}">${cellTxt(mem[b-BASE])}</b><i>+${k*es+j}</i><u>${hx(b)}</u></div>`}
    gs+=`<div class="grp${k>=ln?' stale':''}">${v.arr?`<em>[${k}]${k>=ln?' stale':''}</em>`:''}<div class="cells">${cs}</div><span class="gv">= ${v.t.ptr?hx(rdv(v.t,a)):rdv(v.t,a)}</span></div>`}
   h+=`<div class="row${v===nw?' new':''}${v.dead?' dead':''}${hlv===v.n?' hl':''}${RD.has(v.n)?' read':''}" style="--c:${COL[i%5]}"><div class="lab"><b>${v.n}</b><span>${tn(v.t)}${v.arr?'['+v.cnt+']':''}</span><u>${hx(v.a)}</u></div><div class="gs">${gs}</div>${v.t.ptr?`<s class="dot" data-d="${v.n}"></s>`:''}</div>`});
@@ -1919,6 +1954,7 @@ $('run').onclick=async()=>{if(running)return;if(S.done)await reset();running=tru
 $('rp').innerHTML=['HEX','DEC','BIN','ASCII'].map(r=>`<button data-r="${r}" class="${r===repr?'on':''}">${r}</button>`).join('');
 $('rp').onclick=e=>{const r=e.target.dataset.r;if(!r)return;repr=r;[...$('rp').children].forEach(b=>b.className=b.dataset.r===r?'on':'');rMem()};
 $('rows').onclick=e=>{const c=e.target.closest('.cell');if(c){sel=+c.dataset.a;rMem();rInfo()}};
+$('stringViews').onclick=e=>{if(e.target.closest('[data-string-toggle]')){showAllStrings=!showAllStrings;rMem()}};
 $('vars').onclick=e=>{if(e.target.type==='range')return;const v=e.target.closest('.var');if(v){hlv=hlv===v.dataset.n?null:v.dataset.n;rVars();rMem()}};
 $('bl').innerHTML=BL.map(([h,c,bs])=>`<h3>${h}</h3>`+bs.map(([l,s])=>`<button class="blk" style="--c:${c}" data-c="${esc(s).replace(/"/g,'&quot;')}">${l}</button>`).join('')).join('');
 $('bl').onclick=e=>{const c=e.target.dataset.c;if(c)ins(c.replace(/&lt;/g,'<').replace(/&amp;/g,'&'))};
@@ -1993,6 +2029,8 @@ def run_program(source: str, steps: int, inputs: Optional[list[str]] = None) -> 
             "next_frame_id": state.next_frame_id,
             "node_visits": state.node_visits,
             "input_cursor": state.input_cursor,
+            "execution_state": state.execution_state,
+            "waiting_for_input": state.waiting_for_input,
             "out": state.output,
             "line": state.line,
             "sp": state.memory.sp,
