@@ -145,6 +145,11 @@ class ReturnSignal:
     value: int
 
 
+@dataclass
+class BreakSignal:
+    """Control-flow signal consumed by the nearest loop or switch statement."""
+
+
 class ProgramState:
     """THE single source of truth for a running program.
 
@@ -374,7 +379,7 @@ _TOKEN_RE = re.compile(r"""
   | (?P<id>[A-Za-z_]\w*)
   | (?P<str>"(?:[^"\\]|\\.)*")
   | (?P<chr>'(?:[^'\\]|\\.)')
-  | (?P<op>\+\+|--|<=|>=|==|!=|&&|\|\||[-+*/%]=|[-+*/%&<>=!(){}\[\];,])
+  | (?P<op>\+\+|--|<=|>=|==|!=|&&|\|\||[-+*/%]=|[-+*/%&<>=!(){}\[\];,:])
 """, re.X | re.S)
 
 
@@ -635,6 +640,40 @@ class Parser:
             then = self.statement()
             other = self.statement() if self.accept("else") else None
             return node("If", tok.line, cond=cond, then=then, other=other)
+        if tok.text == "switch":
+            self.i += 1
+            self.expect("(")
+            expr = self.expression()
+            self.expect(")")
+            self.expect("{")
+            cases = []
+            current = None
+            # Group statements under labels. Execution can start at a matching label
+            # and continue through later groups to model C's fall-through behavior.
+            while not self.is_("}"):
+                if self.i >= len(self.t):
+                    raise MemscopeError("Missing '}'")
+                if self.accept("case"):
+                    label = self.t[self.i - 1]
+                    value = self.assignment()  # stops before ':'; colon is a label delimiter
+                    self.expect(":")
+                    current = node("Case", label.line, value=value, body=[])
+                    cases.append(current)
+                elif self.accept("default"):
+                    label = self.t[self.i - 1]
+                    self.expect(":")
+                    current = node("Case", label.line, value=None, body=[])
+                    cases.append(current)
+                else:
+                    if current is None:
+                        raise MemscopeError(f"Expected 'case' or 'default' on line {self.peek().line}")
+                    current.body.append(self.statement())
+            self.i += 1
+            return node("Switch", tok.line, expr=expr, cases=cases)
+        if tok.text == "break":
+            self.i += 1
+            self.expect(";")
+            return node("Break", tok.line)
         if tok.text == "while":
             self.i += 1
             self.expect("(")
@@ -910,6 +949,11 @@ class Interpreter:
             r = (yield from self._eval(n.value)) if n.value is not None else Val(0, INT)
             return ReturnSignal(r.v)
 
+        if k == "Break":
+            emit(s, "BREAK")
+            yield
+            return BreakSignal()
+
         if k == "If":
             taken = yield from self._condition(n.cond, show=True)
             yield
@@ -929,8 +973,12 @@ class Interpreter:
                 count += 1
                 emit(s, "LOOP_ITERATION", n=count, text=n.cond.text)
                 r = yield from self._exec(n.body)
-                if r:
+                if isinstance(r, ReturnSignal):
                     return r
+                if isinstance(r, BreakSignal):
+                    emit(s, "LOOP_BREAK")
+                    yield
+                    return None
                 s.line = n.line
 
         if k == "For":
@@ -950,13 +998,61 @@ class Interpreter:
                     count += 1
                     emit(s, "LOOP_ITERATION", n=count, text=n.cond.text if n.cond is not None else "")
                     r = yield from self._exec(n.body)
-                    if r:
+                    if isinstance(r, ReturnSignal):
                         return r
+                    if isinstance(r, BreakSignal):
+                        emit(s, "LOOP_BREAK")
+                        yield
+                        return None
                     if n.update is not None:
                         s.line = n.line         # the update belongs to the `for` line
                         yield from self._eval(n.update)
             finally:
                 pop_scope(s, frame)
+
+        if k == "Switch":
+            # Evaluate the selector exactly once. Case expressions are constants, so
+            # evaluate them quietly without generating side effects or memory events.
+            selector = yield from self._eval(n.expr)
+            emit(s, "SWITCH_ENTER", expr=n.expr.text, value=selector.v)
+            yield
+            selected = None
+            default_index = None
+            for index, case in enumerate(n.cases):
+                if case.value is None:
+                    default_index = index
+                    continue
+                case_value = self._run_pure(case.value)
+                emit(s, "CASE_CHECK", value=case_value, switch_value=selector.v)
+                yield
+                if selected is None and case_value == selector.v:
+                    selected = index
+                    emit(s, "CASE_MATCH", value=case_value, index=index)
+                    yield
+                    break
+            if selected is None:
+                selected = default_index
+            if selected is not None:
+                frame.scopes.append({})
+                try:
+                    # Do not stop at the next label: reaching it is C-style fall-through.
+                    for index in range(selected, len(n.cases)):
+                        case = n.cases[index]
+                        emit(s, "CASE_EXECUTION", index=index, default=case.value is None)
+                        yield
+                        for stmt in case.body:
+                            result = yield from self._exec(stmt)
+                            if isinstance(result, ReturnSignal):
+                                return result
+                            if isinstance(result, BreakSignal):
+                                emit(s, "SWITCH_EXIT", reason="break")
+                                yield
+                                return None
+                finally:
+                    pop_scope(s, frame)
+            emit(s, "SWITCH_EXIT", reason="complete")
+            yield
+            return None
 
         raise MemscopeError(f"Unsupported statement {k}")
 
