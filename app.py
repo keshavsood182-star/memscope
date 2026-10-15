@@ -150,6 +150,11 @@ class BreakSignal:
     """Control-flow signal consumed by the nearest loop or switch statement."""
 
 
+@dataclass
+class ContinueSignal:
+    """Control-flow signal consumed by the nearest loop (and propagated through switch)."""
+
+
 class ProgramState:
     """THE single source of truth for a running program.
 
@@ -409,8 +414,10 @@ def node(kind: str, line: int, **fields) -> SimpleNamespace:
 
       Expressions                                  Statements
       Num(v)  Str(v)  Var(name)                    Block(body)            If(cond, then, other)
-      Un(op, operand)   Cast(ctype, operand)       While(cond, body)      For(init, cond, update, body)
-      Bin(op, left, right)                         Return(value)          Expr(expr)
+      Un(op, operand)   Cast(ctype, operand)       While(cond, body)      DoWhile(body, cond)
+      Bin(op, left, right)                         For(init, cond, update, body)
+                                                    Switch(expr, cases)    Break / Continue
+                                                    Return(value)          Expr(expr)
       Assign(target, value)                        Decl(ctype, name, size, init, no_react)
       IncDec(op, operand, post)                    InitList(items)  (only inside Decl.init)
       Index(base, index)   Call(name, args)
@@ -457,8 +464,9 @@ class Parser:
 
     def expect(self, text: str) -> None:
         if not self.accept(text):
-            line = (self.t[self.i] if self.i < len(self.t) else self.t[-1]).line
-            raise MemscopeError(f"Expected '{text}' on line {line}")
+            tok = self.t[self.i] if self.i < len(self.t) else self.t[-1]
+            found = f"'{tok.text}'" if self.i < len(self.t) else "end of code"
+            raise MemscopeError(f"Expected '{text}' but found {found} on line {tok.line}")
 
     def is_type(self) -> bool:
         return self.i < len(self.t) and self.t[self.i].text in self.TYPES
@@ -674,12 +682,27 @@ class Parser:
             self.i += 1
             self.expect(";")
             return node("Break", tok.line)
+        if tok.text == "continue":
+            self.i += 1
+            self.expect(";")
+            return node("Continue", tok.line)
         if tok.text == "while":
             self.i += 1
             self.expect("(")
             cond = self.expression()
             self.expect(")")
             return node("While", tok.line, cond=cond, body=self.statement())
+        if tok.text == "do":
+            self.i += 1
+            body = self.statement()
+            if not self.accept("while"):
+                line = self.peek().line if self.i < len(self.t) else tok.line
+                raise MemscopeError(f"Expected 'while' after do body on line {line}")
+            self.expect("(")
+            cond = self.expression()
+            self.expect(")")
+            self.expect(";")
+            return node("DoWhile", tok.line, body=body, cond=cond)
         if tok.text == "for":
             self.i += 1
             self.expect("(")
@@ -844,7 +867,9 @@ class Interpreter:
             s.next_frame_id += 1
             s.frames.append(Frame(s.next_frame_id, "globals" if "main" in program.funcs else "main"))
         for stmt in program.top:
-            yield from self._exec(stmt)
+            result = yield from self._exec(stmt)
+            if isinstance(result, (BreakSignal, ContinueSignal)):
+                raise MemscopeError("break/continue is only valid inside a loop or switch")
         if "main" in program.funcs:
             yield from self._call("main", [], silent=True)
 
@@ -874,6 +899,8 @@ class Interpreter:
             if result:
                 break
         value = result.value if result else 0
+        if isinstance(result, (BreakSignal, ContinueSignal)):
+            raise MemscopeError("break/continue is only valid inside a loop or switch")
         pop_scope(s, frame, keep_visible=(name == "main"))
         s.frames.pop()
         s.call_stack.pop()
@@ -947,12 +974,18 @@ class Interpreter:
 
         if k == "Return":
             r = (yield from self._eval(n.value)) if n.value is not None else Val(0, INT)
+            emit(s, "RETURN", value=r.v)
             return ReturnSignal(r.v)
 
         if k == "Break":
             emit(s, "BREAK")
             yield
             return BreakSignal()
+
+        if k == "Continue":
+            emit(s, "CONTINUE")
+            yield
+            return ContinueSignal()
 
         if k == "If":
             taken = yield from self._condition(n.cond, show=True)
@@ -964,6 +997,8 @@ class Interpreter:
             return None
 
         if k == "While":
+            emit(s, "LOOP_ENTER", kind="while")
+            yield
             count = 0
             while True:
                 if not (yield from self._condition(n.cond)):
@@ -979,13 +1014,38 @@ class Interpreter:
                     emit(s, "LOOP_BREAK")
                     yield
                     return None
+                if isinstance(r, ContinueSignal):
+                    s.line = n.line
+                    continue
                 s.line = n.line
+
+        if k == "DoWhile":
+            emit(s, "LOOP_ENTER", kind="do-while")
+            yield
+            count = 0
+            while True:
+                count += 1
+                emit(s, "LOOP_ITERATION", n=count, text=n.cond.text)
+                r = yield from self._exec(n.body)
+                if isinstance(r, ReturnSignal):
+                    return r
+                if isinstance(r, BreakSignal):
+                    emit(s, "LOOP_BREAK")
+                    yield
+                    return None
+                # Continue reaches the condition test, as required by do-while semantics.
+                if not (yield from self._condition(n.cond)):
+                    emit(s, "LOOP_EXIT", text=n.cond.text)
+                    yield
+                    return None
 
         if k == "For":
             # The for-header gets its own scope so `int i` lives exactly as long as the loop.
             # The init statement runs ONCE here; iterations only run cond -> body -> update.
             frame.scopes.append({})
             try:
+                emit(s, "LOOP_ENTER", kind="for")
+                yield
                 if n.init is not None:
                     yield from self._exec(n.init)
                 count = 0
@@ -1004,6 +1064,12 @@ class Interpreter:
                         emit(s, "LOOP_BREAK")
                         yield
                         return None
+                    if isinstance(r, ContinueSignal):
+                        # A continue in a for body still executes the update clause.
+                        if n.update is not None:
+                            s.line = n.line
+                            yield from self._eval(n.update)
+                        continue
                     if n.update is not None:
                         s.line = n.line         # the update belongs to the `for` line
                         yield from self._eval(n.update)
@@ -1048,6 +1114,9 @@ class Interpreter:
                                 emit(s, "SWITCH_EXIT", reason="break")
                                 yield
                                 return None
+                            if isinstance(result, ContinueSignal):
+                                # continue belongs to an enclosing loop, so preserve it.
+                                return result
                 finally:
                     pop_scope(s, frame)
             emit(s, "SWITCH_EXIT", reason="complete")
