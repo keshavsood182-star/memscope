@@ -43,6 +43,12 @@ class LanguageRegressionTests(unittest.TestCase):
         for kind in ("SWITCH_ENTER", "CASE_CHECK", "CASE_MATCH", "CASE_EXECUTION", "SWITCH_EXIT"):
             self.assertIn(kind, kinds)
 
+    def test_runtime_sized_arrays(self):
+        _, _, result = run("int main(){int n=5;int arr[n];arr[0]=10;arr[1]=20;arr[2]=30;arr[3]=40;arr[4]=50;return arr[4];}")
+        self.assertEqual(result, 50)
+        _, _, result = run("int main(){int a=2;int b=3;int arr[a+b];arr[4]=99;return arr[4];}")
+        self.assertEqual(result, 99)
+
     def test_arrays_pointers_and_functions(self):
         source = "int add(int a,int b){return a+b;} int main(){int a[2]={3,4};int *p=&a[0];return add(*p,a[1]);}"
         _, events, result = run(source)

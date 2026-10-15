@@ -429,6 +429,8 @@ def node(kind: str, line: int, **fields) -> SimpleNamespace:
       IncDec(op, operand, post)                    InitList(items)  (only inside Decl.init)
       Index(base, index)   Call(name, args)
 
+    For declarations, `size` is 0 for inferred arrays (`int a[] = {...}`)
+    or an expression node evaluated at runtime for a VLA (`int a[n + 1]`).
     Expression nodes that are the ROOT of a condition or initializer also get `.text` (source text),
     used only for UI messages such as 'i < n - 1'."""
     return SimpleNamespace(k=kind, line=line, **fields)
@@ -614,7 +616,10 @@ class Parser:
                 raise MemscopeError(f"Expected a name on line {name.line}")
             size = None
             if self.accept("["):
-                size = 0 if self.is_("]") else int(self.next().text)
+                # Preserve a runtime size expression in the AST. A literal is
+                # still represented as a Num node, while [] keeps the existing
+                # zero sentinel for initializer-sized arrays.
+                size = 0 if self.is_("]") else self.expression()
                 self.expect("]")
             init = None
             if self.accept("="):
@@ -966,6 +971,14 @@ class Interpreter:
             # 1. Evaluate the initializer FIRST (reads happen before the new variable exists).
             #    dep_collector records which variables it reads -> reactive dependencies.
             s.dep_collector = set()
+            is_array = n.size is not None
+            runtime_count = None
+            if is_array and n.size != 0:
+                # VLA bounds are ordinary expressions evaluated in the current
+                # environment. The resulting count drives the real allocator.
+                runtime_count = n.size if isinstance(n.size, int) else (yield from self._eval(n.size)).v
+                if runtime_count <= 0:
+                    raise MemscopeError("VLA size must be greater than zero")
             values = None
             if n.init is not None:
                 if n.init.k == "Str" and n.ctype.base == "char" and n.size is not None:
@@ -977,8 +990,7 @@ class Interpreter:
                 else:
                     values = [(yield from self._eval(n.init)).v]
             deps, s.dep_collector = s.dep_collector, None
-            is_array = n.size is not None
-            count = (n.size or len(values or [])) if is_array else 1
+            count = (runtime_count if runtime_count is not None else len(values or [])) if is_array else 1
             if is_array and count == 0:
                 raise MemscopeError("Array needs a size")
             if values and len(values) > count:
